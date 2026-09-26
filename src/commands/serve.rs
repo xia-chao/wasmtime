@@ -1269,6 +1269,33 @@ async fn handle_client(
                     None => None,
                 };
                 let debuggee_store = debuggee_store.as_mut().map(|s| &mut ***s);
+                // RFC 9112 section 3.2:
+                //
+                //   A server MUST respond with a 400 (Bad Request) status code
+                //   to any HTTP/1.1 request message that lacks a Host header
+                //   field ...
+                //
+                // A request without an authority is rejected further down (see
+                // `new_incoming_request`), but that happens inside a worker and
+                // the failure is indistinguishable from an internal error by
+                // the time it reaches here, so answer it as the client error it
+                // is before dispatching.
+                if req.version() == http::Version::HTTP_11
+                    && req.uri().authority().is_none()
+                    && !req.headers().contains_key(http::header::HOST)
+                {
+                    return Ok(Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .header("Content-Type", "text/html; charset=UTF-8")
+                        .body(
+                            Full::new(bytes::Bytes::from_static(
+                                b"<!doctype html><html><head><title>400 Bad Request</title></head><body><center><h1>400 Bad Request</h1><hr>wasmtime</center></body></html>",
+                            ))
+                            .map_err(|_| unreachable!())
+                            .boxed_unsync(),
+                        )
+                        .unwrap());
+                }
                 match handle_request(handler, debuggee_store, req).await {
                     Ok(r) => Ok::<_, Infallible>(r),
                     Err(e) => {
