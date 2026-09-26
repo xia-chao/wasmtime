@@ -1275,12 +1275,16 @@ async fn handle_client(
                 //   to any HTTP/1.1 request message that lacks a Host header
                 //   field ...
                 //
-                // A request without an authority is rejected further down (see
-                // `new_incoming_request`), but that happens inside a worker and
-                // the failure is indistinguishable from an internal error by
-                // the time it reaches here, so answer it as the client error it
-                // is before dispatching.
-                if req.version() == http::Version::HTTP_11
+                // This only applies to `wasi:http/proxy` components: turning
+                // such a request into a guest request fails there because the
+                // request carries neither a URI authority nor a `Host` header
+                // (see `HostIncomingRequest::new_incoming_request`), and that
+                // failure reaches the client as a 500.  A `wasi:http/service`
+                // component handles the same request without error -- the guest
+                // observes `authority() == none` -- so it is deliberately left
+                // untouched here.
+                if matches!(&handler.state().instance, ProxyPre::P2(_))
+                    && req.version() == http::Version::HTTP_11
                     && req.uri().authority().is_none()
                     && !req.headers().contains_key(http::header::HOST)
                 {
