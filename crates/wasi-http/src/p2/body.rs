@@ -94,6 +94,16 @@ enum StreamEnd {
     /// Body was completely read and trailers were read. Here are the trailers.
     /// Note that `None` means that the body finished without trailers.
     Trailers(Option<http::HeaderMap>),
+
+    /// The body finished with an error.
+    ///
+    /// This is reported through `future-trailers` because that future's
+    /// contract is to become ready "when either the trailers have been
+    /// received, or an error has occurred". Dropping the sender without a
+    /// message instead would make that future observe the body as
+    /// successfully finished without trailers, hiding the error from guests
+    /// which only look at the trailers.
+    Error(Error),
 }
 
 /// The concrete type behind the `wasi:io/streams.input-stream` resource returned
@@ -136,6 +146,20 @@ impl HostIncomingBodyStream {
             // Destroy the body to terminate the stream while enqueueing the
             // error to get returned from the next call to `read`.
             Some(Err(e)) => {
+                // Also report this through `tx` so that `future-trailers`
+                // resolves to an error rather than to "no trailers". The
+                // error itself is kept below for the next call to `read`;
+                // `Error` isn't cloneable so the trailers future is handed the
+                // protocol-error category that this failure maps to for
+                // guests (the p2 `error-code` enum has no request-side
+                // "incomplete body" variant).
+                let tx = match mem::replace(&mut self.state, IncomingBodyStreamState::Closed) {
+                    IncomingBodyStreamState::Open { tx, .. } => Some(tx),
+                    IncomingBodyStreamState::Closed => None,
+                };
+                if let Some(tx) = tx {
+                    let _ = tx.send(StreamEnd::Error(Error::HttpProtocolError));
+                }
                 self.error = Some(e);
                 self.state = IncomingBodyStreamState::Closed;
             }
@@ -283,6 +307,12 @@ impl Pollable for HostFutureTrailers {
                 // The body wasn't fully read and was dropped before trailers
                 // were reached. It's up to us now to complete the body.
                 Ok(StreamEnd::Remaining(b)) => body.body = IncomingBodyState::Start(b),
+
+                // The body itself errored out, so report that through this
+                // future as its contract requires.
+                Ok(StreamEnd::Error(e)) => {
+                    *self = HostFutureTrailers::Done(Err(e));
+                }
 
                 // This means there were no trailers present.
                 Ok(StreamEnd::Trailers(None)) | Err(_) => {
